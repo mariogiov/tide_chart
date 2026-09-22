@@ -1,0 +1,40 @@
+name: render tide
+
+on:
+  schedule:
+    # Hourly at :05. Actions cron is best-effort and can drift 10-20 min
+    # under load, which is irrelevant for tides.
+    - cron: "5 * * * *"
+  workflow_dispatch:       # lets you trigger a run by hand from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Render
+        run: uv run tide_render.py --raw --out tide.bmp
+
+      - name: Publish to data branch
+        run: |
+          # Committing a 48KB binary hourly onto main would add ~420MB of
+          # git history per year. Instead: build a throwaway repo holding
+          # only the current file and force-push it as an orphan branch,
+          # so `data` is permanently exactly one commit deep.
+          mkdir -p out && cp tide.bin out/
+          cd out
+          git init -q
+          git checkout -q -b data
+          git config user.name  "tide-bot"
+          git config user.email "tide-bot@users.noreply.github.com"
+          git add tide.bin
+          git commit -q -m "tide $(date -u +%FT%TZ)"
+          git push -q --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" \
+            data
