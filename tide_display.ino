@@ -4,6 +4,10 @@
  * Wake -> WiFi -> download 48,000 packed bytes -> blit -> deep sleep.
  * Everything happens in setup(); deep sleep resets the chip, so setup()
  * runs again on every wake and loop() is never reached.
+ *
+ * Credentials live in secrets.h, which is gitignored. If the compiler
+ * says `secrets.h: No such file or directory`, copy secrets.h.example
+ * to secrets.h and fill it in.
  */
 
 #include <WiFi.h>
@@ -12,21 +16,11 @@
 #include "DEV_Config.h"
 #include "EPD.h"
 
+// WIFI_SSID, WIFI_PASS, IMAGE_URL. Quotes, not angle brackets, so the
+// compiler looks in this sketch folder first.
+#include "secrets.h"
+
 // ---------------------------------------------------------------- config
-
-const char *WIFI_SSID = "your-ssid";
-const char *WIFI_PASS = "your-password";
-
-// Where tide.bin lives. Two shapes:
-//
-//   LAN, plain HTTP (laptop/Pi running `python3 -m http.server 8000`):
-//     "http://192.168.1.50:8000/tide.bin"
-//
-//   GitHub Actions publishing to the `data` branch (HTTPS, required):
-//     "https://raw.githubusercontent.com/<user>/<repo>/data/tide.bin"
-//
-const char *IMAGE_URL =
-    "https://raw.githubusercontent.com/YOURUSER/YOURREPO/data/tide.bin";
 
 const uint32_t SLEEP_MINUTES = 60;
 
@@ -70,7 +64,7 @@ bool connectWiFi() {
 }
 
 // Read the body into `buffer` until we have IMAGE_BYTES or the stream
-// goes quiet. Shared by both transports.
+// goes quiet.
 size_t drain(WiFiClient *stream, uint8_t *buffer) {
   size_t got = 0;
   uint32_t lastData = millis();

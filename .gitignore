@@ -1,1 +1,13 @@
+secrets.h
+
+# Render output
+tide.bin
+tide.bmp
+tide.png
+
+# Python
+__pycache__/
+.venv/
+
+# ESP32 libraries
 esp32_code
