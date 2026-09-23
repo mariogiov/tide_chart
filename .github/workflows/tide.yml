@@ -2,8 +2,8 @@ name: render tide
 
 on:
   schedule:
-    # Half past eveyr hour. Actions cron is best-effort and can drift 10-20 min
-    # under load, which is irrelevant for tides.
+    # Ten past the hour every hour. Actions cron is best-effort and can drift 
+    # 10-20 min under load, which is irrelevant for tides.
     - cron: "10 * * * *"
   workflow_dispatch:       # lets you trigger a run by hand from the Actions tab
 
