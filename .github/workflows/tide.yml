@@ -39,6 +39,13 @@ jobs:
           git config user.email "tide-bot@users.noreply.github.com"
           git add tide.bin tide4.bin
           git commit -q -m "tide $(date -u +%FT%TZ)"
-          git push -q --force \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" \
-            data
+          for i in 1 2 3; do
+            if git push -q --force \
+                "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" \
+                data; then
+              exit 0
+            fi
+            echo "push failed (attempt $i), retrying"
+            sleep $((i * 20))
+          done
+          exit 1
