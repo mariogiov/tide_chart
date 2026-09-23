@@ -60,6 +60,22 @@ FORWARD = dt.timedelta(hours=18)   # how far forward
 PAD = dt.timedelta(days=2)          # extra fetched each side, so the curve
                                     # always has a bracketing pair at the edges
 
+# Draw the chart for the top of the NEXT hour rather than the moment of
+# rendering. Timing, all three of which move together:
+#   GitHub renders at :10            (cron "10 * * * *" in main.yml)
+#   the display fetches at :30       (FETCH_MINUTE in schedule.h)
+#   so it's on the wall :30 -> :30, with the top of the hour in the middle
+# Tide predictions don't change depending on when you compute them, so a
+# chart drawn at 7:10 for 8:00 is exactly as accurate as one drawn at 8:00.
+# Pass --live to draw for the actual current time instead (for testing).
+SNAP_TO_NEXT_HOUR = True
+
+# Each image stays on the wall for about an hour, centered on the time it's
+# drawn for. A high or low that falls inside that hour is neither clearly
+# "last" nor "next" -- it happens while you're looking -- so it gets its own
+# NOW slot, and "rising"/"falling" becomes "turning".
+VIEW_HALF_WINDOW = dt.timedelta(minutes=30)
+
 WIDTH, HEIGHT, DPI = 800, 480, 100
 THRESHOLD = 170                     # plain cutoff for everything else
 INVERT_RAW = False                  # flip if the panel renders a negative
@@ -152,17 +168,32 @@ def interpolate(extremes, start, end, step_minutes=10):
     return times, heights
 
 
-def summarize(extremes, now):
-    """Flat dict of facts for the text panel. The renderer only formats."""
-    past = [e for e in extremes if e[0] <= now]
-    future = [e for e in extremes if e[0] > now]
+def summarize(extremes, now, half_window=VIEW_HALF_WINDOW):
+    """Flat dict of facts for the text panel. The renderer only formats.
+
+    Extremes are sorted into three groups relative to the hour the image is
+    on display, not the single instant it's drawn for:
+
+        past    before the window   -> LAST
+        during  inside the window   -> NOW, and the tide is "turning"
+        future  after the window    -> NEXT
+
+    so every label stays true for the whole time the image is up. Outside a
+    turn, rising/falling can't flip mid-window either: the direction only
+    changes at an extreme, and there isn't one in the window.
+    """
+    lo, hi = now - half_window, now + half_window
+    past = [e for e in extremes if e[0] < lo]
+    during = [e for e in extremes if lo <= e[0] <= hi]
+    future = [e for e in extremes if e[0] > hi]
 
     current = height_at(extremes, now)
-    rising = future[0][2] == "H" if future else None
+    rising = future[0][2] == "H" if (future and not during) else None
 
     return {
         "current": current,
         "rising": rising,
+        "turning": during[0] if during else None,
         "prev": past[-1] if past else None,
         "next": future[:3],
     }
@@ -178,7 +209,8 @@ def _fmt_event(event):
     return label, clock, f"{height:.2f} ft"
 
 
-def render(times, heights, summary, extremes, now, gray4=False):
+def render(times, heights, summary, extremes, now, gray4=False,
+           rendered=None):
     """Draw the layout and return a PIL Image at exactly 800x480."""
     fig = plt.figure(figsize=(WIDTH / DPI, HEIGHT / DPI), dpi=DPI)
     fig.patch.set_facecolor("white")
@@ -190,16 +222,26 @@ def render(times, heights, summary, extremes, now, gray4=False):
              color="0.35")
 
     if summary["current"] is not None:
-        arrow = "\u2191" if summary["rising"] else "\u2193"
-        state = "rising" if summary["rising"] else "falling"
-        fig.text(0.035, 0.78, f"{summary['current']:.2f} ft {arrow}",
-                 fontsize=26, weight="bold", va="top")
+        if summary["turning"]:
+            kind = "high" if summary["turning"][2] == "H" else "low"
+            headline = f"{summary['current']:.2f} ft"
+            state = f"{kind} tide, turning"
+        else:
+            arrow = "\u2191" if summary["rising"] else "\u2193"
+            headline = f"{summary['current']:.2f} ft {arrow}"
+            state = "rising" if summary["rising"] else "falling"
+        fig.text(0.035, 0.78, headline, fontsize=26, weight="bold", va="top")
         fig.text(0.035, 0.665, state, fontsize=11, va="top", color="0.35")
 
+    # The slot under the headline shows the turn in progress if there is
+    # one, otherwise the most recent high or low.
     y = 0.58
-    if summary["prev"]:
-        label, clock, height = _fmt_event(summary["prev"])
-        fig.text(0.035, y, "LAST", fontsize=10, weight="bold", color="0.35",
+    slot = (("NOW", summary["turning"]) if summary["turning"]
+            else ("LAST", summary["prev"]) if summary["prev"] else None)
+    if slot:
+        title, event = slot
+        label, clock, height = _fmt_event(event)
+        fig.text(0.035, y, title, fontsize=10, weight="bold", color="0.35",
                  va="top")
         fig.text(0.035, y - 0.055, f"{label}  {clock}", fontsize=12, va="top")
         fig.text(0.035, y - 0.105, height, fontsize=12, va="top", color="0.3")
@@ -243,7 +285,10 @@ def render(times, heights, summary, extremes, now, gray4=False):
         pad = (max(heights) - min(heights)) * 0.22 + 0.3
         ax.set_ylim(min(heights) - pad, max(heights) + pad)
 
-        ax.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, 4)))
+        # Labels every 4 hours, anchored so one always falls on the chart's
+        # own hour -- the "now" line then always sits on a labeled tick.
+        ax.xaxis.set_major_locator(
+            mdates.HourLocator(byhour=range(now.hour % 4, 24, 4)))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%-I%p"))
 
     for side in ("top", "right"):
@@ -258,8 +303,12 @@ def render(times, heights, summary, extremes, now, gray4=False):
         ax.grid(axis="y", color="black", linewidth=0.6, linestyle=(0, (1, 6)))
     ax.set_axisbelow(True)
 
-    fig.text(0.965, 0.035, now.strftime("updated %-I:%M %p %b %-d"),
-             fontsize=9, color="0.35", ha="right")
+    # "for" the time the chart shows, "drawn" when it was actually rendered.
+    # A drawn time more than ~an hour old means updates have stopped.
+    footer = now.strftime("for %-I:%M %p %b %-d")
+    if rendered is not None and rendered != now:
+        footer += rendered.strftime("  \u00b7  drawn %-I:%M %p")
+    fig.text(0.965, 0.035, footer, fontsize=9, color="0.35", ha="right")
 
     fig.canvas.draw()
     img = Image.frombuffer(
@@ -400,9 +449,16 @@ def main():
     ap.add_argument("--gray4", action="store_true",
                     help="4-level grayscale: 96,000 bytes, needs the "
                          "Init_4Gray/Display_4Gray firmware")
+    ap.add_argument("--live", action="store_true",
+                    help="draw for the actual current time instead of the "
+                         "next top of the hour")
     args = ap.parse_args()
 
-    now = station_now()
+    rendered = station_now()
+    if SNAP_TO_NEXT_HOUR and not args.live:
+        now = rendered.replace(minute=0) + dt.timedelta(hours=1)
+    else:
+        now = rendered
     start, end = now - BACK, now + FORWARD
 
     if args.fake:
@@ -420,7 +476,7 @@ def main():
         return 1
 
     img = render(times, heights, summarize(extremes, now), extremes, now,
-                 gray4=args.gray4)
+                 gray4=args.gray4, rendered=rendered)
 
     if args.gray4:
         levels = to_4gray(img)
