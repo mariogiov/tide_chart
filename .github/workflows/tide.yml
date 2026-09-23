@@ -19,7 +19,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
 
       - name: Render
-        run: uv run tide_render.py --raw --out tide.bmp
+        run: |
+          # Publish both formats so the ESP32 can switch between 1-bit and
+          # 4-gray by changing one URL, with no workflow edit.
+          uv run tide_render.py --raw --out tide.bmp
+          uv run tide_render.py --raw --gray4 --out tide4.bmp
 
       - name: Publish to data branch
         run: |
@@ -27,13 +31,13 @@ jobs:
           # git history per year. Instead: build a throwaway repo holding
           # only the current file and force-push it as an orphan branch,
           # so `data` is permanently exactly one commit deep.
-          mkdir -p out && cp tide.bin out/
+          mkdir -p out && cp tide.bin tide4.bin out/
           cd out
           git init -q
           git checkout -q -b data
           git config user.name  "tide-bot"
           git config user.email "tide-bot@users.noreply.github.com"
-          git add tide.bin
+          git add tide.bin tide4.bin
           git commit -q -m "tide $(date -u +%FT%TZ)"
           git push -q --force \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" \

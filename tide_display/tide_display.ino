@@ -1,7 +1,7 @@
 /*
  * Tide display firmware — Waveshare 7.5" e-Paper + e-Paper ESP32 Driver Board
  *
- * Wake -> WiFi -> download 48,000 packed bytes -> blit -> deep sleep.
+ * Wake -> WiFi -> download one packed framebuffer -> blit -> deep sleep.
  * Everything happens in setup(); deep sleep resets the chip, so setup()
  * runs again on every wake and loop() is never reached.
  *
@@ -22,10 +22,23 @@
 
 // ---------------------------------------------------------------- config
 
+// 0 = black/white, 1 bit per pixel, 48,000 bytes.
+// 1 = four gray levels, 2 bits per pixel, 96,000 bytes.
+//
+// This MUST match how the image was rendered. Point IMAGE_URL at a
+// tide.bin produced with --gray4 when this is 1, and one produced
+// without it when this is 0. Mismatched sizes are rejected rather
+// than blitted, so the screen keeps its old image and the serial log
+// says what it got.
+#define GRAY4 1
+
 const uint32_t SLEEP_MINUTES = 60;
 
-// 800 x 480 pixels, 8 per byte. Fixed by the panel.
-const size_t IMAGE_BYTES = 800 * 480 / 8;   // 48000
+#if GRAY4
+const size_t IMAGE_BYTES = 800 * 480 / 4;   // 96000, 4 px per byte
+#else
+const size_t IMAGE_BYTES = 800 * 480 / 8;   // 48000, 8 px per byte
+#endif
 
 const uint32_t WIFI_TIMEOUT_MS = 20000;
 const uint32_t HTTP_TIMEOUT_MS = 20000;
@@ -100,6 +113,12 @@ bool downloadImage(uint8_t *buffer) {
     // months later. If that tradeoff bothers you, pin GitHub's root with
     // secure.setCACert(...) and set a calendar reminder.
     secure.setInsecure();
+    // If 4-gray runs out of heap, the two ways out are:
+    //   1. uncomment this -- smaller TLS buffers, but a server that sends
+    //      TLS records larger than the rx buffer will fail the handshake
+    //   2. serve tide.bin over plain HTTP from a machine on your LAN,
+    //      which skips TLS entirely and frees the whole ~40KB
+    // secure.setBufferSizes(4096, 2048);
     http.begin(secure, IMAGE_URL);
   } else {
     http.begin(IMAGE_URL);
@@ -144,20 +163,41 @@ void setup() {
   Serial.println("\n--- wake ---");
 
   DEV_Module_Init();
+#if GRAY4
+  EPD_7IN5_V2_Init_4Gray();
+#else
   EPD_7IN5_V2_Init();
+#endif
+
+  // getMaxAllocHeap is the largest CONTIGUOUS block, which is what a single
+  // big malloc actually needs -- total free heap can look fine while no one
+  // block is large enough.
+  Serial.printf("want %u bytes; largest free block %u\n",
+                (unsigned)IMAGE_BYTES, (unsigned)ESP.getMaxAllocHeap());
 
   uint8_t *buffer = (uint8_t *)malloc(IMAGE_BYTES);
   if (buffer == NULL) {
-    Serial.println("malloc failed");
+    // In 4-gray this is the likely failure: 96KB has to be ONE contiguous
+    // block, and total free heap can look fine while no single block is
+    // big enough.
+    Serial.println("malloc failed -- not enough contiguous heap");
     sleepNow();
   }
-  // 48KB framebuffer + ~40KB of TLS wants headroom. If this prints under
-  // ~60000 after the malloc, HTTPS is where it will fail.
-  Serial.printf("free heap %u\n", (unsigned)ESP.getFreeHeap());
+
+  // TLS wants roughly another 40KB on top of the framebuffer. If this
+  // prints under ~45000, HTTPS is where it will fail; see the notes in
+  // downloadImage() for the two ways out.
+  Serial.printf("free heap after malloc %u\n", (unsigned)ESP.getFreeHeap());
 
   if (connectWiFi() && downloadImage(buffer)) {
     Serial.println("display");
+#if GRAY4
+    // Noticeably slower than the 1-bit refresh: reaching the intermediate
+    // levels takes more waveform passes.
+    EPD_7IN5_V2_Display_4Gray(buffer);
+#else
     EPD_7IN5_V2_Display(buffer);
+#endif
   } else {
     // Leave the previous image on screen rather than clearing it. Stale
     // tides beat a blank panel, and e-paper holds the last frame for free.

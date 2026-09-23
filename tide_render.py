@@ -21,6 +21,7 @@ import argparse
 import datetime as dt
 import math
 import sys
+from zoneinfo import ZoneInfo
 
 import requests
 import matplotlib
@@ -33,7 +34,26 @@ from PIL import Image
 
 STATION = "9413745"
 STATION_NAME = "Santa Cruz"
+
+# NOAA returns extreme times in lst_ldt -- the STATION's local time, with
+# daylight saving. So "now" has to be the station's local time too, not the
+# machine's. A GitHub Actions runner is UTC, which would put the now-line
+# 7 or 8 hours ahead of tide times that were already correct: a chart that
+# is internally inconsistent rather than uniformly wrong. ZoneInfo tracks
+# PDT/PST the same way lst_ldt does, so the two stay in step across DST.
+STATION_TZ = ZoneInfo("America/Los_Angeles")
 API = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+
+
+def station_now():
+    """Current time at the station, as a naive datetime.
+
+    Naive, so it compares directly against the naive datetimes parsed out
+    of NOAA's response -- everything downstream stays in one timezone-free
+    world anchored to the station.
+    """
+    return dt.datetime.now(STATION_TZ).replace(tzinfo=None,
+                                               second=0, microsecond=0)
 
 BACK = dt.timedelta(hours=6)        # how far back the chart shows
 FORWARD = dt.timedelta(hours=18)   # how far forward
@@ -43,8 +63,16 @@ PAD = dt.timedelta(days=2)          # extra fetched each side, so the curve
 WIDTH, HEIGHT, DPI = 800, 480, 100
 THRESHOLD = 170                     # plain cutoff for everything else
 INVERT_RAW = False                  # flip if the panel renders a negative
-FILL_GRAY = "0.80"                  # the under-curve fill; dithered, not solid
-DITHER_BAND = (185, 225)            # gray values in here become a dot screen
+FILL_GRAY = "0.80"                  # 1-bit: under-curve fill, dithered
+DITHER_BAND = (185, 225)            # 1-bit: values in here become a dot screen
+
+# --- 4-gray mode ---
+# The panel has four levels: black, dark gray, light gray, white. These are
+# the source-gray cut points between them, and the fill/gridline grays are
+# chosen to land squarely inside their buckets rather than near a boundary.
+GRAY_CUTS = (64, 128, 192)
+FILL_GRAY_4 = "0.72"                # -> 184, light-gray bucket
+RULE_GRAY_4 = "0.45"                # -> 115, dark-gray bucket
 
 
 # ---------------------------------------------------------------- data
@@ -150,7 +178,7 @@ def _fmt_event(event):
     return label, clock, f"{height:.2f} ft"
 
 
-def render(times, heights, summary, extremes, now):
+def render(times, heights, summary, extremes, now, gray4=False):
     """Draw the layout and return a PIL Image at exactly 800x480."""
     fig = plt.figure(figsize=(WIDTH / DPI, HEIGHT / DPI), dpi=DPI)
     fig.patch.set_facecolor("white")
@@ -194,9 +222,11 @@ def render(times, heights, summary, extremes, now):
     if times:
         ax.plot(times, heights, color="black", linewidth=2.4, solid_capstyle="round")
         ax.fill_between(times, heights, min(heights) - 2,
-                        facecolor=FILL_GRAY, edgecolor="none", linewidth=0.0)
+                        facecolor=FILL_GRAY_4 if gray4 else FILL_GRAY,
+                        edgecolor="none", linewidth=0.0)
 
-        ax.axhline(0, color="0.6", linewidth=0.9, linestyle=(0, (4, 4)))
+        ax.axhline(0, color=RULE_GRAY_4 if gray4 else "0.6",
+                   linewidth=1.1 if gray4 else 0.9, linestyle=(0, (4, 4)))
         ax.axvline(now, color="black", linewidth=1.6)
 
         # mark every extreme inside the visible window -- not just the ones
@@ -222,8 +252,10 @@ def render(times, heights, summary, extremes, now):
         ax.spines[side].set_linewidth(1.2)
 
     ax.tick_params(labelsize=10, width=1.2, length=4)
-    ax.grid(axis="y", color="black", linewidth=0.6,
-            linestyle=(0, (1, 6)))
+    if gray4:
+        ax.grid(axis="y", color=RULE_GRAY_4, linewidth=0.8)
+    else:
+        ax.grid(axis="y", color="black", linewidth=0.6, linestyle=(0, (1, 6)))
     ax.set_axisbelow(True)
 
     fig.text(0.965, 0.035, now.strftime("updated %-I:%M %p %b %-d"),
@@ -291,6 +323,55 @@ def to_raw(bw):
     return bytes(b ^ 0xFF for b in data) if INVERT_RAW else data
 
 
+def to_4gray(img):
+    """Quantize to the panel's four levels. Returns a uint8 array of
+    level indices 0..3, where 0 is black and 3 is white.
+
+    No dithering here: with four real levels, matplotlib's own
+    antialiasing already supplies the intermediate tones, and that is
+    exactly what makes 4-gray text look better than 1-bit text.
+    """
+    a = np.asarray(img.convert("L"))
+    lo, mid, hi = GRAY_CUTS
+    return (np.digitize(a, (lo, mid, hi))).astype(np.uint8)   # 0..3
+
+
+def to_raw_4gray(levels):
+    """Pack level indices into the 96,000 bytes Display_4Gray expects.
+
+    800 x 480 at 2 bits per pixel = 4 pixels per byte, leftmost pixel in
+    the high bits, row-major, top to bottom. 0b11 is white, matching the
+    driver initialising its buffer to 0xFF.
+
+    MSB-first is inferred from the 1-bit convention (verified working on
+    this panel) plus the buffer-size math, NOT from reading Waveshare's
+    packing loop. If the image comes out with fine vertical smearing --
+    detail shuffled within each group of 4 pixels -- the bit order is
+    reversed and the fix is to flip the shift order below.
+    """
+    if levels.shape != (HEIGHT, WIDTH):
+        raise ValueError(f"expected {HEIGHT}x{WIDTH}, got {levels.shape}")
+
+    v = levels
+    if INVERT_RAW:
+        v = 3 - v
+
+    g = v.reshape(HEIGHT, WIDTH // 4, 4)
+    packed = (g[:, :, 0] << 6) | (g[:, :, 1] << 4) | (g[:, :, 2] << 2) | g[:, :, 3]
+
+    data = packed.astype(np.uint8).tobytes()
+    expected = WIDTH * HEIGHT // 4
+    if len(data) != expected:
+        raise ValueError(f"expected {expected} bytes, got {len(data)}")
+    return data
+
+
+def preview_4gray(levels):
+    """Level indices -> a viewable 8-bit image, for --png."""
+    ramp = np.array([0, 85, 170, 255], dtype=np.uint8)
+    return Image.fromarray(ramp[levels], mode="L")
+
+
 # ---------------------------------------------------------------- fake data
 
 def fake_extremes(now):
@@ -316,9 +397,12 @@ def main():
                     help="also write a full-color PNG for previewing")
     ap.add_argument("--raw", action="store_true",
                     help="also write packed bytes for the ESP32 to blit")
+    ap.add_argument("--gray4", action="store_true",
+                    help="4-level grayscale: 96,000 bytes, needs the "
+                         "Init_4Gray/Display_4Gray firmware")
     args = ap.parse_args()
 
-    now = dt.datetime.now().replace(second=0, microsecond=0)
+    now = station_now()
     start, end = now - BACK, now + FORWARD
 
     if args.fake:
@@ -335,17 +419,26 @@ def main():
         print("no curve: extremes did not bracket the window", file=sys.stderr)
         return 1
 
-    img = render(times, heights, summarize(extremes, now), extremes, now)
+    img = render(times, heights, summarize(extremes, now), extremes, now,
+                 gray4=args.gray4)
+
+    if args.gray4:
+        levels = to_4gray(img)
+        shown = preview_4gray(levels)
+        raw = to_raw_4gray(levels)
+    else:
+        shown = to_1bit(img)
+        raw = to_raw(shown)
+
     if args.png:
-        img.save(args.out.rsplit(".", 1)[0] + ".png")
-    bw = to_1bit(img)
-    bw.save(args.out)
+        shown.convert("RGB").save(args.out.rsplit(".", 1)[0] + ".png")
+    shown.save(args.out)
 
     if args.raw:
         raw_path = args.out.rsplit(".", 1)[0] + ".bin"
         with open(raw_path, "wb") as fh:
-            fh.write(to_raw(bw))
-        print(f"wrote {raw_path}  ({WIDTH * HEIGHT // 8} bytes)")
+            fh.write(raw)
+        print(f"wrote {raw_path}  ({len(raw)} bytes)")
 
     print(f"wrote {args.out}  ({len(times)} points, "
           f"{min(heights):.2f}..{max(heights):.2f} ft)")
