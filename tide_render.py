@@ -44,6 +44,21 @@ STATION_NAME = "Santa Cruz"
 STATION_TZ = ZoneInfo("America/Los_Angeles")
 API = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
 
+# ---- weather offset from Monterey -------------------------------------------
+# Predictions are astronomy only. Wind, storms and air pressure push the real
+# sea above or below them. Santa Cruz has no live gauge, so borrow Monterey's:
+# its measured level minus its own prediction is the weather offset, and on
+# the scale of storms the two sides of the bay move together.
+OFFSET_STATION = "9413450"          # Monterey, CA -- real-time gauge
+OFFSET_LOOKBACK = dt.timedelta(hours=3)   # fetch this much recent data
+OFFSET_AVERAGE = dt.timedelta(hours=1)    # ...and summarize the last hour
+OFFSET_MAX_AGE = dt.timedelta(minutes=90) # older than this = gauge is down
+OFFSET_MIN_POINTS = 5               # 6-min data: 10 per hour when healthy
+OFFSET_MIN_SHOW = 0.1               # ft; smaller offsets aren't worth a line
+TRACE_SMOOTH = 5                    # readings (x 6 min) in the dotted line's
+                                    # rolling median -- irons out bay sloshing
+TRACE_MAX_GAP = dt.timedelta(minutes=18)  # break the dotted line at data holes
+
 
 def station_now():
     """Current time at the station, as a naive datetime.
@@ -60,21 +75,25 @@ FORWARD = dt.timedelta(hours=18)   # how far forward
 PAD = dt.timedelta(days=2)          # extra fetched each side, so the curve
                                     # always has a bracketing pair at the edges
 
-# Draw the chart for the top of the NEXT hour rather than the moment of
-# rendering. Timing, all three of which move together:
-#   GitHub renders at :10            (cron "10 * * * *" in main.yml)
-#   the display fetches at :30       (FETCH_MINUTE in schedule.h)
-#   so it's on the wall :30 -> :30, with the top of the hour in the middle
-# Tide predictions don't change depending on when you compute them, so a
-# chart drawn at 7:10 for 8:00 is exactly as accurate as one drawn at 8:00.
-# Pass --live to draw for the actual current time instead (for testing).
-SNAP_TO_NEXT_HOUR = True
+# Where the "now" line goes.
+#   False (default): at the moment of rendering. The measured dotted line then
+#       runs right up to it. Render shortly before the display fetches
+#       (e.g. trigger at :25, FETCH_MINUTE 30) so the image is fresh when it
+#       lands; it then ages about an hour until the next one replaces it.
+#   True (--snap-hour): at the top of the next hour, so an image rendered at
+#       :10 and shown :30 -> :30 is centered on the hour it depicts. The
+#       dotted line then stops short of the now line, since it can't know
+#       the future.
+SNAP_TO_NEXT_HOUR = False
 
-# Each image stays on the wall for about an hour, centered on the time it's
-# drawn for. A high or low that falls inside that hour is neither clearly
-# "last" nor "next" -- it happens while you're looking -- so it gets its own
-# NOW slot, and "rising"/"falling" becomes "turning".
+# Each image stays on the wall for about an hour. A high or low that falls
+# while it's up is neither clearly "last" nor "next" -- it happens while
+# you're looking -- so it gets its own NOW slot, and "rising"/"falling"
+# becomes "turning". The window is that hour, placed per the mode above:
+#   snapped:   centered on the drawn-for hour  (now - 30 min .. now + 30 min)
+#   unsnapped: starting at render time         (now .. now + DISPLAY_SPAN)
 VIEW_HALF_WINDOW = dt.timedelta(minutes=30)
+DISPLAY_SPAN = dt.timedelta(minutes=70)   # wait until fetch + an hour on the wall
 
 WIDTH, HEIGHT, DPI = 800, 480, 100
 THRESHOLD = 170                     # plain cutoff for everything else
@@ -126,6 +145,119 @@ def fetch_extremes(station, begin, end):
     return sorted(out, key=lambda e: e[0])
 
 
+def _noaa_get(params):
+    """One CO-OPS request. NOAA reports errors in-band with a 200."""
+    r = requests.get(API, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message", str(data)[:200]))
+    return data
+
+
+def _series(rows):
+    """[{"t": "2026-09-29 00:06", "v": "3.412", ...}] -> {datetime: float}.
+
+    Real-time data has holes: a missing reading arrives with v == "".
+    Those are dropped rather than treated as zero.
+    """
+    out = {}
+    for row in rows:
+        v = row.get("v", "")
+        if v in ("", None):
+            continue
+        out[dt.datetime.strptime(row["t"], "%Y-%m-%d %H:%M")] = float(v)
+    return out
+
+
+def fetch_offset_data(station, begin, end):
+    """Observed and predicted 6-minute water levels for [begin, end].
+
+    Returns (observed, predicted), each {datetime: feet above MLLW}.
+    """
+    common = {
+        "station": station,
+        "begin_date": begin.strftime("%Y%m%d %H:%M"),
+        "end_date": end.strftime("%Y%m%d %H:%M"),
+        "datum": "MLLW",
+        "units": "english",
+        "time_zone": "lst_ldt",
+        "format": "json",
+    }
+    obs = _noaa_get({**common, "product": "water_level"})
+    pred = _noaa_get({**common, "product": "predictions", "interval": "6"})
+    return _series(obs.get("data", [])), _series(pred.get("predictions", []))
+
+
+def anomaly_series(observed, predicted, now):
+    """[(time, observed - predicted)] at every matched reading up to now."""
+    return sorted((t, observed[t] - predicted[t])
+                  for t in observed if t in predicted and t <= now)
+
+
+def weather_offset(observed, predicted, now):
+    """Median of (observed - predicted) over the most recent hour, in feet.
+
+    Positive: the sea is running above prediction. Returns None when the
+    data can't support a number -- too few matched readings, or the newest
+    one too old (gauge down, or NOAA hasn't posted recent data yet). The
+    median shrugs off the odd spike from a wave or a bad sample.
+    """
+    matched = anomaly_series(observed, predicted, now)
+    if not matched:
+        return None
+    newest = matched[-1][0]
+    if now - newest > OFFSET_MAX_AGE:
+        return None
+    recent = [d for t, d in matched if t > newest - OFFSET_AVERAGE]
+    if len(recent) < OFFSET_MIN_POINTS:
+        return None
+    return float(np.median(recent))
+
+
+def measured_trace(anomalies, extremes, start):
+    """Estimated real water level at Santa Cruz, for the dotted line.
+
+    Santa Cruz's own prediction plus Monterey's weather anomaly at each
+    6-minute reading, smoothed with a short rolling median. Returns
+    (times, heights) with NaN wherever the gauge data has a hole, so the
+    line breaks instead of drawing a straight bridge across missing data.
+    """
+    pts = [(t, a) for t, a in anomalies if t >= start]
+    if len(pts) < TRACE_SMOOTH:
+        return [], []
+    half = TRACE_SMOOTH // 2
+    raw = [a for _, a in pts]
+    smooth = [float(np.median(raw[max(0, i - half): i + half + 1]))
+              for i in range(len(raw))]
+
+    times, heights, prev = [], [], None
+    for (t, _), a in zip(pts, smooth):
+        base = height_at(extremes, t)
+        if base is None:
+            continue
+        if prev is not None and t - prev > TRACE_MAX_GAP:
+            times.append(prev + (t - prev) / 2)   # NaN = pen up
+            heights.append(float("nan"))
+        times.append(t)
+        heights.append(base + a)
+        prev = t
+    return times, heights
+
+
+def fake_anomalies(offset, start, end):
+    """Synthetic gauge anomalies for --fake-offset: the given offset, drifting
+    a little and wobbling the way a real gauge record does."""
+    out, t, i = [], start, 0
+    while t <= end:
+        drift = 0.12 * (i / 50) - 0.06
+        wobble = 0.05 * math.sin(i / 2.3) + 0.03 * math.sin(i * 1.7)
+        out.append((t, offset + drift + wobble))
+        t += dt.timedelta(minutes=6)
+        i += 1
+    return out
+
+
 def height_at(extremes, when):
     """Interpolated height at a single instant, or None if unbracketed.
 
@@ -168,7 +300,7 @@ def interpolate(extremes, start, end, step_minutes=10):
     return times, heights
 
 
-def summarize(extremes, now, half_window=VIEW_HALF_WINDOW):
+def summarize(extremes, now, window=None):
     """Flat dict of facts for the text panel. The renderer only formats.
 
     Extremes are sorted into three groups relative to the hour the image is
@@ -182,7 +314,7 @@ def summarize(extremes, now, half_window=VIEW_HALF_WINDOW):
     turn, rising/falling can't flip mid-window either: the direction only
     changes at an extreme, and there isn't one in the window.
     """
-    lo, hi = now - half_window, now + half_window
+    lo, hi = window or (now - VIEW_HALF_WINDOW, now + VIEW_HALF_WINDOW)
     past = [e for e in extremes if e[0] < lo]
     during = [e for e in extremes if lo <= e[0] <= hi]
     future = [e for e in extremes if e[0] > hi]
@@ -210,7 +342,7 @@ def _fmt_event(event):
 
 
 def render(times, heights, summary, extremes, now, gray4=False,
-           rendered=None):
+           rendered=None, offset=None, trace=None):
     """Draw the layout and return a PIL Image at exactly 800x480."""
     fig = plt.figure(figsize=(WIDTH / DPI, HEIGHT / DPI), dpi=DPI)
     fig.patch.set_facecolor("white")
@@ -258,6 +390,19 @@ def render(times, heights, summary, extremes, now, gray4=False,
                      color="0.3")
             y -= 0.115
 
+    # ---- top right: weather offset ----------------------------------------
+    # Only when it's big enough to matter. The curve and headline stay pure
+    # prediction; this line says how far the real sea is off from them.
+    if offset is not None and abs(offset) >= OFFSET_MIN_SHOW:
+        way = "above" if offset > 0 else "below"
+        fig.text(0.965, 0.955,
+                 f"sea running {abs(offset):.1f} ft {way} prediction",
+                 fontsize=11, weight="bold", ha="right", va="top")
+    has_trace = bool(trace and trace[0])
+    if has_trace:
+        fig.text(0.965, 0.91, "dotted: measured, via Monterey gauge",
+                 fontsize=9, ha="right", va="top", color="0.35")
+
     # ---- right: the curve -------------------------------------------------
     ax = fig.add_axes([0.30, 0.13, 0.665, 0.75])
 
@@ -271,19 +416,36 @@ def render(times, heights, summary, extremes, now, gray4=False,
                    linewidth=1.1 if gray4 else 0.9, linestyle=(0, (4, 4)))
         ax.axvline(now, color="black", linewidth=1.6)
 
+        # Measured water, dotted, drawn over the predicted line so where the
+        # two agree the dots simply vanish into it.
+        if has_trace:
+            ax.plot(trace[0], trace[1], color="black", linewidth=2.2,
+                    linestyle=(0, (0.1, 2.2)), dash_capstyle="round")
+
         # mark every extreme inside the visible window -- not just the ones
         # in `summary`, which only holds prev + next three
         lo, hi = times[0], times[-1]
         for when, height, _ in extremes:
             if lo <= when <= hi:
                 ax.plot([when], [height], "o", color="black", markersize=5)
-                ax.annotate(f"{height:.1f}", (when, height),
+                # Lift the label clear of the dotted line where it runs higher.
+                anchor = height
+                if has_trace:
+                    near = [h for t, h in zip(*trace)
+                            if abs(t - when) <= dt.timedelta(minutes=30)
+                            and not math.isnan(h)]
+                    if near:
+                        anchor = max(height, max(near))
+                ax.annotate(f"{height:.1f}", (when, anchor),
                             textcoords="offset points", xytext=(0, 10),
                             ha="center", fontsize=10)
 
         ax.set_xlim(lo, hi)
-        pad = (max(heights) - min(heights)) * 0.22 + 0.3
-        ax.set_ylim(min(heights) - pad, max(heights) + pad)
+        shown = list(heights)
+        if has_trace:
+            shown += [h for h in trace[1] if not math.isnan(h)]
+        pad = (max(shown) - min(shown)) * 0.22 + 0.3
+        ax.set_ylim(min(shown) - pad, max(shown) + pad)
 
         # Labels every 4 hours, anchored so one always falls on the chart's
         # own hour -- the "now" line then always sits on a labeled tick.
@@ -305,8 +467,10 @@ def render(times, heights, summary, extremes, now, gray4=False,
 
     # "for" the time the chart shows, "drawn" when it was actually rendered.
     # A drawn time more than ~an hour old means updates have stopped.
-    footer = now.strftime("for %-I:%M %p %b %-d")
-    if rendered is not None and rendered != now:
+    if rendered is None or rendered == now:
+        footer = now.strftime("as of %-I:%M %p %b %-d")
+    else:
+        footer = now.strftime("for %-I:%M %p %b %-d")
         footer += rendered.strftime("  \u00b7  drawn %-I:%M %p")
     fig.text(0.965, 0.035, footer, fontsize=9, color="0.35", ha="right")
 
@@ -449,16 +613,23 @@ def main():
     ap.add_argument("--gray4", action="store_true",
                     help="4-level grayscale: 96,000 bytes, needs the "
                          "Init_4Gray/Display_4Gray firmware")
-    ap.add_argument("--live", action="store_true",
-                    help="draw for the actual current time instead of the "
-                         "next top of the hour")
+    ap.add_argument("--no-offset", action="store_true",
+                    help="skip the Monterey weather-offset line")
+    ap.add_argument("--fake-offset", type=float, default=None, metavar="FT",
+                    help="pretend the offset is FT feet (layout testing)")
+    ap.add_argument("--snap-hour", action="store_true",
+                    help="put the now line at the next top of the hour "
+                         "instead of the moment of rendering")
     args = ap.parse_args()
 
     rendered = station_now()
-    if SNAP_TO_NEXT_HOUR and not args.live:
+    snap = SNAP_TO_NEXT_HOUR or args.snap_hour
+    if snap:
         now = rendered.replace(minute=0) + dt.timedelta(hours=1)
+        window = (now - VIEW_HALF_WINDOW, now + VIEW_HALF_WINDOW)
     else:
         now = rendered
+        window = (now, now + DISPLAY_SPAN)
     start, end = now - BACK, now + FORWARD
 
     if args.fake:
@@ -470,13 +641,33 @@ def main():
             print(f"fetch failed: {exc}", file=sys.stderr)
             return 1
 
+    # The offset is measured up to the moment of rendering, not the hour the
+    # chart is drawn for -- it's about the weather, which changes over hours.
+    # Any failure here just drops the line; it must never cost the chart.
+    offset, anomalies = None, []
+    if args.fake_offset is not None:
+        offset = args.fake_offset
+        anomalies = fake_anomalies(offset, start, rendered)
+    elif not (args.fake or args.no_offset):
+        try:
+            observed, predicted = fetch_offset_data(
+                OFFSET_STATION, min(start, rendered - OFFSET_LOOKBACK), rendered)
+            offset = weather_offset(observed, predicted, rendered)
+            anomalies = anomaly_series(observed, predicted, rendered)
+        except Exception as exc:
+            print(f"offset fetch failed (chart unaffected): {exc}",
+                  file=sys.stderr)
+        print("weather offset: " +
+              ("unavailable" if offset is None else f"{offset:+.2f} ft"))
+
     times, heights = interpolate(extremes, start, end)
+    trace = measured_trace(anomalies, extremes, start) if anomalies else None
     if not times:
         print("no curve: extremes did not bracket the window", file=sys.stderr)
         return 1
 
-    img = render(times, heights, summarize(extremes, now), extremes, now,
-                 gray4=args.gray4, rendered=rendered)
+    img = render(times, heights, summarize(extremes, now, window), extremes, now,
+                 gray4=args.gray4, rendered=rendered, offset=offset, trace=trace)
 
     if args.gray4:
         levels = to_4gray(img)
