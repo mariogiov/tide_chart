@@ -43,3 +43,7 @@ void draw_chart(Canvas &c, const ChartInput &in);
 // battery. E-ink holds it with no power, so it stays up until someone
 // plugs the display in.
 void draw_charge_me(Canvas &c, const char *station_name, bool gray4 = false);
+
+// A plain status screen -- e.g. waiting for the first download.
+void draw_message(Canvas &c, const char *title, const char *line1,
+                  const char *line2, bool gray4 = false);

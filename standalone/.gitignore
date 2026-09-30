@@ -1,0 +1,10 @@
+tide_standalone/secrets.h
+host/preview
+host/test
+host/*.bmp
+host/*.bin
+host/*.csv
+host/sim/sim
+host/sim/sketch.o
+host/sim/out_*
+host/sim/*.log

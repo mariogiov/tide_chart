@@ -360,3 +360,15 @@ void draw_charge_me(Canvas &c, const char *station_name, bool gray4) {
   snprintf(buf, sizeof(buf), "%s Tides", station_name);
   c.text(font_tiny, cx, Y(0.08), buf, BLACK, CENTER);
 }
+
+void draw_message(Canvas &c, const char *title, const char *line1,
+                  const char *line2, bool gray4) {
+  W = c.width();
+  H = c.height();
+  c.clear(WHITE);
+  c.set_antialias(gray4);
+  const int cx = W / 2;
+  c.text(font_title, cx, Y(0.62), title, BLACK, CENTER);
+  if (line1) c.text(font_body, cx, Y(0.50), line1, BLACK, CENTER);
+  if (line2) c.text(font_body, cx, Y(0.44), line2, BLACK, CENTER);
+}
