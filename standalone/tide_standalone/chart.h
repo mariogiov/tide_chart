@@ -42,4 +42,4 @@ void draw_chart(Canvas &c, const ChartInput &in);
 // The last thing the display shows before it stops waking to protect the
 // battery. E-ink holds it with no power, so it stays up until someone
 // plugs the display in.
-void draw_charge_me(Canvas &c, const char *station_name);
+void draw_charge_me(Canvas &c, const char *station_name, bool gray4 = false);

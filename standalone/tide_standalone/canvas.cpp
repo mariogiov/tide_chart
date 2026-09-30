@@ -1,5 +1,6 @@
 #include "canvas.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -85,6 +86,56 @@ void Canvas::dashed_hline(int x0, int x1, int y, int on, int off, Level c) {
     if ((x - x0) % period < on) set(x, y, c);
 }
 
+// ---- smooth drawing -------------------------------------------------------
+
+void Canvas::darken(int x, int y, Level c) {
+  if (c < get(x, y)) set(x, y, c);
+}
+
+// Ink of color `c` covering fraction `coverage` of a pixel. With antialias
+// on, the result is the level nearest to mixing `c` with white in that
+// proportion; darken() then keeps whichever is darker, pixel or ink.
+void Canvas::blend(int x, int y, Level c, float coverage) {
+  if (coverage <= 0.0f) return;
+  if (!aa_) {
+    if (coverage >= 0.5f) darken(x, y, c);
+    return;
+  }
+  if (coverage > 1.0f) coverage = 1.0f;
+  const float v = 3.0f - coverage * (3.0f - (float)c);
+  darken(x, y, (Level)(int)(v + 0.5f));
+}
+
+// Distance from point (px, py) to the segment (ax, ay)-(bx, by).
+static float seg_dist(float px, float py, float ax, float ay, float bx, float by) {
+  const float dx = bx - ax, dy = by - ay;
+  const float len2 = dx * dx + dy * dy;
+  float t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+  t = t < 0 ? 0 : (t > 1 ? 1 : t);
+  const float ex = ax + t * dx - px, ey = ay + t * dy - py;
+  return sqrtf(ex * ex + ey * ey);
+}
+
+// A polyline `width` pixels wide with round joins. Coverage of a pixel is
+// approximated from the distance between its center and the line's
+// centerline: fully inside at half-width - 0.5, fully outside at + 0.5.
+void Canvas::stroke(const float *xs, const float *ys, int n, float width, Level c) {
+  const float r = width / 2.0f;
+  for (int i = 0; i + 1 < n || (n == 1 && i == 0); i++) {
+    const float ax = xs[i], ay = ys[i];
+    const float bx = n == 1 ? ax : xs[i + 1], by = n == 1 ? ay : ys[i + 1];
+    const int x0 = (int)floorf(fminf(ax, bx) - r - 1), x1 = (int)ceilf(fmaxf(ax, bx) + r + 1);
+    const int y0 = (int)floorf(fminf(ay, by) - r - 1), y1 = (int)ceilf(fmaxf(ay, by) + r + 1);
+    for (int y = y0; y <= y1; y++)
+      for (int x = x0; x <= x1; x++)
+        blend(x, y, c, r + 0.5f - seg_dist((float)x, (float)y, ax, ay, bx, by));
+  }
+}
+
+void Canvas::disc(float cx, float cy, float r, Level c) {
+  stroke(&cx, &cy, 1, 2.0f * r, c);
+}
+
 // ---- text -------------------------------------------------------------
 
 // Next codepoint from a UTF-8 string; advances *s. Bad bytes read as '?'.
@@ -117,7 +168,7 @@ static const Glyph *find_glyph(const Font &f, uint32_t cp) {
 
 int Canvas::cap_height(const Font &f) {
   const Glyph *g = find_glyph(f, 'H');
-  return g ? -g->yoff : f.ascent;
+  return g ? -g->mono_y : f.ascent;
 }
 
 int Canvas::text_width(const Font &f, const char *s) const {
@@ -138,13 +189,23 @@ int Canvas::text(const Font &f, int x, int y, const char *s, Level c,
   while (*s) {
     const Glyph *g = find_glyph(f, next_cp(&s));
     if (!g) continue;
-    const uint8_t *bits = f.bitmap + g->offset;
-    int bit = 0;
-    for (int j = 0; j < g->height; j++) {
-      for (int i = 0; i < g->width; i++, bit++) {
-        if (bits[bit >> 3] & (0x80 >> (bit & 7)))
-          set(x + g->xoff + i, baseline + g->yoff + j, c);
-      }
+    if (aa_) {
+      // 2-bit coverage per pixel, blended into the gray levels.
+      const uint8_t *bits = f.bitmap + g->aa_offset;
+      int k = 0;
+      for (int j = 0; j < g->aa_h; j++)
+        for (int i = 0; i < g->aa_w; i++, k++) {
+          const int cov = (bits[k >> 2] >> (6 - 2 * (k & 3))) & 3;
+          if (cov) blend(x + g->aa_x + i, baseline + g->aa_y + j, c, cov / 3.0f);
+        }
+    } else {
+      // Hinted black-and-white: every pixel fully on or off.
+      const uint8_t *bits = f.bitmap + g->mono_offset;
+      int k = 0;
+      for (int j = 0; j < g->mono_h; j++)
+        for (int i = 0; i < g->mono_w; i++, k++)
+          if (bits[k >> 3] & (0x80 >> (k & 7)))
+            darken(x + g->mono_x + i, baseline + g->mono_y + j, c);
     }
     x += g->advance;
   }

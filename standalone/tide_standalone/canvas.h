@@ -29,6 +29,11 @@ class Canvas {
   size_t bytes() const { return (size_t)w_ * h_ / 4; }
   const uint8_t *data() const { return buf_; }
 
+  // Smooth edges using the gray levels. On for 4-level panels; off for
+  // 1-bit ones, where gray edge pixels would come out as dither speckle.
+  void set_antialias(bool on) { aa_ = on; }
+  bool antialias() const { return aa_; }
+
   void clear(Level c = WHITE);
   void set(int x, int y, Level c);
   Level get(int x, int y) const;
@@ -42,6 +47,13 @@ class Canvas {
   void line(int x0, int y0, int x1, int y1, int thickness, Level c);
   // Dashed horizontal line: `on` pixels drawn, `off` skipped, repeating.
   void dashed_hline(int x0, int x1, int y, int on, int off, Level c);
+
+  // Smooth shapes at sub-pixel positions, for curves and dots. Each pixel
+  // gets ink in proportion to how much of it the shape covers, drawn in
+  // the nearest gray (antialias on) or all-or-nothing at half coverage
+  // (antialias off). Ink only ever darkens what's already there.
+  void stroke(const float *xs, const float *ys, int n, float width, Level c);
+  void disc(float cx, float cy, float r, Level c);
 
   // Text. `y` is the TOP of the line (like matplotlib's va="top"); the
   // baseline sits `font.ascent` below it. UTF-8, for the arrows and dots.
@@ -59,6 +71,10 @@ class Canvas {
   void to_1bit(uint8_t *out) const;
 
  private:
+  void darken(int x, int y, Level c);
+  void blend(int x, int y, Level c, float coverage);
+
+  bool aa_ = false;
   int w_, h_;
   uint8_t *buf_;
   bool owned_;

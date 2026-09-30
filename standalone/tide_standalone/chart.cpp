@@ -129,8 +129,12 @@ struct Axes {
   int x_of(epoch_t t) const {
     return x0 + (int)lround((double)(t - t0) * (x1 - x0) / (double)(t1 - t0));
   }
-  int y_of(double h) const {
-    return y1 - (int)lround((h - h0) * (y1 - y0) / (h1 - h0));
+  int y_of(double h) const { return (int)lround(yf(h)); }
+  float yf(double h) const {       // unrounded, for smooth drawing
+    return (float)(y1 - (h - h0) * (y1 - y0) / (h1 - h0));
+  }
+  float xf(epoch_t t) const {
+    return (float)(x0 + (double)(t - t0) * (x1 - x0) / (double)(t1 - t0));
   }
   epoch_t t_of(int x) const {
     return t0 + (epoch_t)llround((double)(x - x0) * (t1 - t0) / (x1 - x0));
@@ -204,31 +208,35 @@ static void draw_curve(Canvas &c, const ChartInput &in, Level gray) {
     c.fill_rect(x - 1, ax.y0, 2, ax.y1 - ax.y0 + 1, BLACK);
   }
 
-  // 5. The predicted curve, 3 px.
-  for (int i = 1; i < ncol; i++)
-    c.line(ax.x0 + i - 1, ax.y_of(col[i - 1]), ax.x0 + i, ax.y_of(col[i]), 3, BLACK);
+  // 5. The predicted curve, drawn smooth at sub-pixel heights.
+  float *xs = new float[ncol], *ys = new float[ncol];
+  for (int i = 0; i < ncol; i++) { xs[i] = (float)(ax.x0 + i); ys[i] = ax.yf(col[i]); }
+  c.stroke(xs, ys, ncol, 3.2f, BLACK);
+  delete[] xs;
+  delete[] ys;
 
   // 6. Measured water, dotted: a small dot every DOT_GAP pixels of path.
   //    Where it agrees with the prediction the dots vanish into the curve.
   if (has_trace) {
     const double DOT_GAP = 7.0;
+    const float DOT_R = 1.6f;
     double carry = 0;
     bool pen = false;
-    int px = 0, py = 0;
+    float px = 0, py = 0;
     for (size_t i = 0; i < in.trace_n; i++) {
       const float h = in.trace_h[i];
       const epoch_t t = in.trace_t[i];
       if (isnan(h) || t < ax.t0 || t > ax.t1) { pen = false; continue; }
-      const int x = ax.x_of(t), y = ax.y_of(h);
+      const float x = ax.xf(t), y = ax.yf(h);
       if (!pen) {
-        c.fill_circle(x, y, 1, BLACK);
+        c.disc(x, y, DOT_R, BLACK);
         carry = 0;
         pen = true;
       } else {
         const double dx = x - px, dy = y - py, len = sqrt(dx * dx + dy * dy);
         double d = DOT_GAP - carry;
         while (d <= len) {
-          c.fill_circle((int)lround(px + dx * d / len), (int)lround(py + dy * d / len), 1, BLACK);
+          c.disc((float)(px + dx * d / len), (float)(py + dy * d / len), DOT_R, BLACK);
           d += DOT_GAP;
         }
         carry = len - (d - DOT_GAP);
@@ -244,7 +252,7 @@ static void draw_curve(Canvas &c, const ChartInput &in, Level gray) {
     const Extreme &e = in.extremes[i];
     if (e.t < ax.t0 || e.t > ax.t1) continue;
     const int x = ax.x_of(e.t);
-    c.fill_circle(x, ax.y_of(e.h), 3, BLACK);
+    c.disc(ax.xf(e.t), ax.yf(e.h), 3.6f, BLACK);
     double anchor = e.h;
     for (size_t k = 0; has_trace && k < in.trace_n; k++) {
       const epoch_t dt = in.trace_t[k] - e.t;
@@ -293,6 +301,7 @@ void draw_chart(Canvas &c, const ChartInput &in) {
   W = c.width();
   H = c.height();
   c.clear(WHITE);
+  c.set_antialias(in.gray4);
   // On a 1-bit panel a gray would come out dithered, which breaks up text
   // and thin rules. So "gray" means dark gray on a 4-level panel and plain
   // black on a 1-bit one, as in the Python version.
@@ -332,10 +341,11 @@ void draw_chart(Canvas &c, const ChartInput &in) {
   }
 }
 
-void draw_charge_me(Canvas &c, const char *station_name) {
+void draw_charge_me(Canvas &c, const char *station_name, bool gray4) {
   W = c.width();
   H = c.height();
   c.clear(WHITE);
+  c.set_antialias(gray4);
   const int cx = W / 2;
 
   // A big empty battery, drawn from rectangles.

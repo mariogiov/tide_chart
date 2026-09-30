@@ -2,13 +2,21 @@
 #pragma once
 #include <stdint.h>
 
+// Every glyph is stored twice (see tools/make_fonts.py):
+//   mono  1 bit/pixel, hinted -- crisp on 1-bit panels
+//   aa    2 bits/pixel of coverage, 0..3 -- smooth edges on gray panels
+// Offsets are into the font's bitmap, in bytes. x/y place the bitmap's
+// top-left corner relative to the pen position on the baseline (y < 0 is
+// above the baseline).
 struct Glyph {
   uint32_t codepoint;
-  uint32_t offset;     // into the font's bitmap, in bytes
-  uint8_t  width, height;
-  int8_t   xoff;       // bitmap's left edge, relative to the pen position
-  int8_t   yoff;       // bitmap's top edge, relative to the baseline (<0 = above)
-  uint8_t  advance;    // how far the pen moves after this glyph
+  uint8_t  advance;     // how far the pen moves after this glyph
+  uint32_t mono_offset;
+  uint8_t  mono_w, mono_h;
+  int8_t   mono_x, mono_y;
+  uint32_t aa_offset;
+  uint8_t  aa_w, aa_h;
+  int8_t   aa_x, aa_y;
 };
 
 struct Font {

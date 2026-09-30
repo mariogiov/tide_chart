@@ -108,7 +108,7 @@ int main(int argc, char **argv) {
   std::vector<float> trace_h;
 
   if (charge_me) {
-    draw_charge_me(canvas, station);
+    draw_charge_me(canvas, station, gray4);
   } else {
     if (csv) {
       std::string text = read_file(csv);
